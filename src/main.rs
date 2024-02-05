@@ -1,8 +1,9 @@
+use anyhow::Result;
+use std::collections::VecDeque;
 use std::env;
 use std::fs::File;
 use std::os::unix::process::CommandExt;
 use std::{
-    error::Error,
     fs,
     io::{self, Write},
     process::Command,
@@ -18,7 +19,7 @@ use crossterm::{
 use ratatui::{prelude::*, widgets::*};
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
 struct Item(String);
 
 impl Item {
@@ -36,15 +37,27 @@ impl Item {
 
 #[derive(Default, Serialize, Deserialize)]
 struct App {
-    recents: Vec<Item>,
+    recents: VecDeque<Item>,
     bookmarks: Vec<Item>,
+}
+
+impl App {
+    fn save(&self, path: &str) -> Result<()> {
+        let data = serde_json::to_string(self)?;
+        let mut file = File::options()
+            .write(true)
+            .truncate(true)
+            .open(format!("{path}/app.db"))?;
+        write!(file, "{}", data)?;
+        Ok(())
+    }
 }
 
 fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     mut app: App,
     tick_rate: Duration,
-) -> Result<Option<String>, Box<dyn Error>> {
+) -> Result<Option<String>> {
     let mut last_tick = Instant::now();
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
@@ -117,10 +130,11 @@ fn ui(f: &mut Frame, app: &mut App) {
     );
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+fn main() -> Result<()> {
     let matches = command!()
+        .arg(arg!([PATH] "File to open"))
         .arg(arg!(-b --bookmark <PATH> "Add path to bookmarks"))
-        .arg(arg!(-c --clear "Clear recents and bookmarks"))
+        .arg(arg!(-d --delete <KEY> "Delete item from recents/bookmarks"))
         .get_matches();
 
     let db_path = format!(
@@ -137,14 +151,35 @@ fn main() -> Result<(), Box<dyn Error>> {
         serde_json::from_str(&fs::read_to_string(format!("{db_path}/app.db"))?).unwrap_or_default();
 
     if let Some(path) = matches.get_one::<String>("bookmark") {
-        app.bookmarks.push(Item(path.clone()));
-        let data = serde_json::to_string(&app)?;
-        let mut file = File::options()
-            .write(true)
-            .truncate(true)
-            .open(format!("{db_path}/app.db"))?;
-        write!(file, "{}", data)?;
+        if app.bookmarks.len() < 6 {
+            app.bookmarks.push(Item(path.clone()));
+            app.save(&db_path)?;
+        }
         return Ok(());
+    }
+
+    if let Some(key) = matches.get_one::<String>("delete") {
+        let c = key.chars().next().unwrap();
+        let idx = c.to_digit(16).unwrap() as usize;
+        app.recents.remove(idx);
+        let idx = idx - app.recents.len();
+        app.bookmarks.remove(idx);
+        app.save(&db_path)?;
+        return Ok(());
+    }
+
+    if let Some(path) = matches.get_one::<String>("PATH") {
+        let path = env::current_dir().unwrap().join(path);
+        let item = Item(path.to_str().unwrap().to_owned());
+        if let Some(pos) = app.recents.iter().position(|x| x.eq(&item)) {
+            app.recents.remove(pos);
+        }
+        app.recents.push_front(item);
+        if app.recents.len() > 10 {
+            app.recents.pop_back();
+        }
+        app.save(&db_path)?;
+        Command::new("hx").arg(path).exec();
     }
 
     enable_raw_mode()?;
